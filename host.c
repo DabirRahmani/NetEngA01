@@ -4,9 +4,60 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define PORT 12345            // Port number to be used by the server
 #define CHUNK_SIZE 10000      // Size of each file chunk to be sent
+
+typedef struct {
+    int sockfd;
+    struct sockaddr_in client_addr;
+    FILE *file;
+    long file_size;
+    int total_chunks;
+    int *acknowledged_chunks;
+} thread_data_t;
+
+typedef struct {
+    struct sockaddr_in client_addr;
+    bool active;
+} client_info_t;
+
+typedef struct {
+    int sockfd;
+    struct sockaddr_in client_addr;
+    int *acknowledged_chunks;
+    int total_chunks;
+} ack_thread_data_t;
+
+bool client_exists(client_info_t clients[], struct sockaddr_in *client_addr, int max_clients) {
+    for (int i = 0; i < max_clients; i++) {
+        if (clients[i].active && clients[i].client_addr.sin_addr.s_addr == client_addr->sin_addr.s_addr && clients[i].client_addr.sin_port == client_addr->sin_port) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void *listen_for_acks(void *arg) {
+    ack_thread_data_t *data = (ack_thread_data_t *)arg;
+    char buffer[CHUNK_SIZE];
+    socklen_t addr_len = sizeof(data->client_addr);
+
+    while (1) {
+        int n = recvfrom(data->sockfd, buffer, sizeof(int), 0, (struct sockaddr *)&data->client_addr, &addr_len);
+        int seq_num_recvd = *(int *)buffer;
+        printf("Received seq ack: %d\n", seq_num_recvd);
+        if (seq_num_recvd < data->total_chunks) {
+            data->acknowledged_chunks[seq_num_recvd] = 1;
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+
 
 // Function to send a file chunk with sequence number
 void send_file_chunk_with_seq(FILE *file, struct sockaddr_in *client_addr, int sockfd, int seq_num) {
@@ -22,23 +73,87 @@ void send_file_chunk_with_seq(FILE *file, struct sockaddr_in *client_addr, int s
     sendto(sockfd, buffer, sizeof(int) + bytes_read, 0, (struct sockaddr *)client_addr, sizeof(*client_addr));
 }
 
-int main() {
-    int sockfd;  // Socket file descriptor
-    struct sockaddr_in server_addr, client_addr;  // Server and client address structures
-    socklen_t addr_len = sizeof(client_addr);  // Length of the client address
-    char buffer[CHUNK_SIZE];  // Buffer to hold incoming data
+void *handle_client(void *arg) {
+    thread_data_t *data = (thread_data_t *)arg;
+    char buffer[CHUNK_SIZE];
+    socklen_t addr_len = sizeof(data->client_addr);
+    int seq_num = 0;
+    bool finished = false;
+    bool first_time = true;
 
-    // Create a UDP socket
+    // Create the acknowledgment listening thread
+    ack_thread_data_t *ack_data = (ack_thread_data_t *)malloc(sizeof(ack_thread_data_t));
+    ack_data->sockfd = data->sockfd;
+    ack_data->client_addr = data->client_addr;
+    ack_data->acknowledged_chunks = data->acknowledged_chunks;
+    ack_data->total_chunks = data->total_chunks;
+
+    pthread_t ack_tid;
+    pthread_create(&ack_tid, NULL, listen_for_acks, (void *)ack_data);
+
+    while (seq_num <= data->total_chunks) {
+        send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, seq_num);
+        seq_num++;
+    }
+
+    //usleep(500 * 1000);
+
+    printf("Acknowledged Chunks:\n");
+    for (int i = 0; i < data->total_chunks; i++) {
+        printf("%d ", data->acknowledged_chunks[i]);
+    }
+
+    //send remaining chunks
+    seq_num = 0;
+    while (!finished) {
+        if(seq_num == 0) finished = true;
+        for (int i = seq_num; i < data->total_chunks; i++) {
+            if (data->acknowledged_chunks[i] == 0) {
+                finished = false;
+                seq_num = i;
+                break;
+            }
+        }
+        send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, seq_num);
+
+        if(seq_num == data->total_chunks -1){
+            seq_num = 0;
+        }
+        
+    }
+
+    pthread_exit(NULL);
+}
+
+void print_sockaddr_in(struct sockaddr_in *addr) {
+    char ip[INET_ADDRSTRLEN];
+    
+    // Convert the IP address from binary to text form
+    inet_ntop(AF_INET, &(addr->sin_addr), ip, INET_ADDRSTRLEN);
+    
+    // Print the elements of sockaddr_in
+    printf("Family: %d\n", addr->sin_family);
+    printf("Port: %d\n", ntohs(addr->sin_port)); // Convert port from network byte order to host byte order
+    printf("IP Address: %s\n", ip);
+}
+
+int main() {
+    int sockfd;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    char buffer[CHUNK_SIZE];
+    const int MAX_CLIENTS = 10; // Define the maximum number of clients
+    client_info_t clients[MAX_CLIENTS] = {}; // Array to store client info
+
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
-    // Bind the socket to the specified port
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;  // IPv4
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // Any incoming interface
-    server_addr.sin_port = htons(PORT);  // Port number
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
 
     if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
@@ -46,110 +161,62 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Open the file to be sent
     FILE *file = fopen("largefile.mkv", "rb");
     if (!file) {
         perror("File open failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    // اینجا باید اول یه ارایه بولین بسازیم برای تعداد سکوينس ها
-    // همه رو اول فالس میذاریم
-    // Initialize a boolean array to track received sequence numbers
-    fseek(file, 0, SEEK_END); // Move file pointer to the end
-    long file_size = ftell(file); // Get the current position, which is the size
-    fseek(file, 0, SEEK_SET); // Move file pointer back to the beginning
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
     int total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int *acknowledged_chunks = (int *)calloc(total_chunks, sizeof(int));
-
     if (!acknowledged_chunks) {
         perror("Memory allocation failed");
         fclose(file);
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-
     for (int i = 0; i < total_chunks; i++) {
         acknowledged_chunks[i] = 0;
     }
 
-    int seq_num = 0;  // Sequence number for file chunks
+    printf("Must send %d chunks: \n", total_chunks);
 
-    printf("Must send %d chunks: \n", total_chunks); // سایز فایل رو داره اشتباه میفرسته
 
-    bool started = false;
-
-    // Main loop to receive requests and send file chunks
     while (1) {
-        // Receive a message from the client
         int n = recvfrom(sockfd, buffer, CHUNK_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
-        int seq_num_recvd = *(int *)buffer;
+        if (n > 0) {
+            if (!client_exists(clients, &client_addr, MAX_CLIENTS)) {
+                for (int i = 0; i < MAX_CLIENTS; i++) {
+                    if (!clients[i].active) {
+                        clients[i].client_addr = client_addr;
+                        clients[i].active = true;
 
-        if (seq_num_recvd >= 0) {
+                        thread_data_t *data = (thread_data_t *)malloc(sizeof(thread_data_t));
+                        data->sockfd = sockfd;
+                        data->client_addr = client_addr;
+                        data->file = file;
+                        data->file_size = file_size;
+                        data->total_chunks = total_chunks;
+                        data->acknowledged_chunks = acknowledged_chunks;
 
-            if(started)
-            {
-                printf("Received seq ack: %d\n", seq_num_recvd);
-                // اینجا به ازای هر سکوینسی که دریافت کنیم باید اون بولینش رو ترو کنیم 
-                if (seq_num_recvd < total_chunks) {
-                    acknowledged_chunks[seq_num_recvd] = 1;
-                } else {
-                    if(seq_num_recvd > total_chunks){
+                        printf("Creating a thread for:\n");
+                        print_sockaddr_in(&data->client_addr);
+
+                        pthread_t tid;
+                        pthread_create(&tid, NULL, handle_client, (void *)data);
+                        pthread_detach(tid);
                         break;
-                        // بریک کردیم اما ممکنه هنوز بعضی از چانک ها ارسال نشده باشن
-                    } 
+                    }
                 }
             }
-
-            // Send a chunk of the file with the current sequence number
-            send_file_chunk_with_seq(file, &client_addr, sockfd, seq_num);
-            seq_num++;
-            started = true;
         }
     }
 
-    seq_num = 0;
-    bool finished = false;
-
-    while (1) {
-
-        // ارسال چانک هایی که جا موندن
-        //check array and if its finished. break;
-        finished = true;
-        for (int i = 0; i < total_chunks; i++) {
-            if(acknowledged_chunks[i] == 0) {
-                finished = false;
-                seq_num = i;
-                break;
-            }
-        }
-
-        if(finished){
-            int endMessage = -1;
-            sendto(sockfd, &endMessage, sizeof(int), 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
-            break;
-        }
-        else{
-
-            // الان مشخص شده که کدوم رو باید بفرستیم
-            send_file_chunk_with_seq(file, &client_addr, sockfd, seq_num);
-                            
-            // Receive a message from the client
-            printf("waiting for seq_num_recvd");
-            int n = recvfrom(sockfd, buffer, CHUNK_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
-            int seq_num_recvd = *(int *)buffer;
-            printf("seq_num_recvd %d \n", seq_num_recvd);
-
-            if (seq_num_recvd < total_chunks) {
-                acknowledged_chunks[seq_num_recvd] = 1;
-            }
-        }
-
-    }
-
-    // Close the file and socket
     fclose(file);
     close(sockfd);
-
     return 0;
 }
