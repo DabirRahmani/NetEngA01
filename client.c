@@ -33,7 +33,7 @@ void *receive_file_chunk(void *arg) {
             seq_num = *(int *)buffer;
 
             if(seq_num == -1) {
-                printf("seq num = -1 recvd. closing TID %d", data->thread_id);
+                printf("seq num = -1 recvd. closing TID %d\n", data->thread_id);
                 break;
             }
 

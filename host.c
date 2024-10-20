@@ -6,6 +6,8 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <time.h>
 
 #define PORT 12345            // Port number to be used by the server
 #define CHUNK_SIZE 10000      // Size of each file chunk to be sent
@@ -57,7 +59,16 @@ void *listen_for_acks(void *arg) {
     pthread_exit(NULL);
 }
 
+long long current_time_in_ms() {
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    return spec.tv_sec * 1000 + spec.tv_nsec / 1000000;
+}
 
+bool compare_time_in_ms(long long stored_time) {
+    long long current_time = current_time_in_ms();
+    return (current_time - stored_time) > 100; // Example: Check if more than 200 ms have passed
+}
 
 // Function to send a file chunk with sequence number
 void send_file_chunk_with_seq(FILE *file, struct sockaddr_in *client_addr, int sockfd, int seq_num) {
@@ -65,6 +76,10 @@ void send_file_chunk_with_seq(FILE *file, struct sockaddr_in *client_addr, int s
     
     // Copy the sequence number to the buffer
     memcpy(buffer, &seq_num, sizeof(int));
+
+    long position = seq_num * CHUNK_SIZE;
+
+    fseek(file, position, SEEK_SET);
     
     // Read a chunk of the file into the buffer
     int bytes_read = fread(buffer + sizeof(int), 1, CHUNK_SIZE, file);
@@ -91,36 +106,137 @@ void *handle_client(void *arg) {
     pthread_t ack_tid;
     pthread_create(&ack_tid, NULL, listen_for_acks, (void *)ack_data);
 
-    while (seq_num <= data->total_chunks) {
-        send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, seq_num);
-        seq_num++;
-    }
+    //send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, chunkNumber);
 
-    //usleep(500 * 1000);
+    int sendingChunks[8] = { -1,-1,-1,-1,-1,-1,-1,-1}; // چانکهایی که ارسال شدن و منتظر جوابیم
+    int mustSentChunks[8] = { -1,-1,-1,-1,-1,-1,-1,-1}; //چانک هایی که باید ارسال بشن
+    int sentUntil = 0;
 
-    printf("Acknowledged Chunks:\n");
-    for (int i = 0; i < data->total_chunks; i++) {
-        printf("%d ", data->acknowledged_chunks[i]);
-    }
+    long long times[8] = { 0,0,0,0,0,0,0,0};
 
-    //send remaining chunks
-    seq_num = 0;
-    while (!finished) {
-        if(seq_num == 0) finished = true;
-        for (int i = seq_num; i < data->total_chunks; i++) {
-            if (data->acknowledged_chunks[i] == 0) {
-                finished = false;
-                seq_num = i;
-                break;
+
+    while(true)
+    {
+
+        // بررسی شود که چه چانک هایی برای ارسال داریم
+        // آرایه اول رو پر میکنیم تا اگر جا باشه ارسال کنیم
+        for(int i = sentUntil; i<data->total_chunks ; i++){
+            // اینجا خوب میشه اگر بررسی کنیم که جا چطوره و اگر پر باشه بریک کنیم که این تا اخر لوپ نره
+            if(data->acknowledged_chunks[i] == 0){ // اول میبینیم کدوما اک نشدن
+                bool chunkExists = false;
+                for(int j = 0 ; j < 8; j++){                
+                    if (mustSentChunks[j] == i){ // اول چک میکنیم که آیا توی این آرایه وجود داره یا نه
+                        chunkExists = true;
+                        break;
+                    }
+                }
+                if(!chunkExists){
+                    for(int j = 0 ; j < 8; j++){ // اگر توی این آرایه نباشه
+                        if (mustSentChunks[j] == -1){ // همچنین اگر جا داشته باشیم اضافه میکنیم
+                            mustSentChunks[j] = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        } 
+
+        // چانک ها را ارسال کنیم
+        // اما اینجا پاک نمیکنیم. تو مرحله بعد از هر دو آرایه پاک میکنیم
+        // اینجا اونایی رو ارسال میکنیم که ارسال نشدن تا حالا
+        // همچنین باید چک کنیم که آرایه دوم جا داشته باشه
+        for(int i =0; i< 8; i++){
+            bool chunkIsInBoth = false; // اگر این ترو بشه یعنی قبلا ارسال شده
+            if(mustSentChunks[i] != -1){ // اگر چیزی برای ارسال باشه
+                for(int j = 0 ; j< 8 ; j++){
+                    if(sendingChunks[j] == mustSentChunks[i]) //اگر قبلا ارسال شده
+                    chunkIsInBoth = true;
+                    break;
+                }
+            }
+            if(!chunkIsInBoth)
+            {
+                // اگر دومی جا داشته باشه
+                for(int j =0 ; j< 8; j++){
+                    if(sendingChunks[j] == -1)
+                    {
+                        if(mustSentChunks[i] != -1)
+                        {
+                        printf("sending %d\n", mustSentChunks[i]);
+                        send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, mustSentChunks[i]);
+                        times[j] = current_time_in_ms();
+                        sendingChunks[j] = mustSentChunks[i]; 
+                        // ارسال میکنیم و این چانک رو به چانک های در حال ارسال اضافه میکنیم
+                        break;
+                        }
+                    }
+                }
+
             }
         }
-        send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, seq_num);
 
-        if(seq_num == data->total_chunks -1){
-            seq_num = 0;
+        // منتظر بمونیم که یکی از چانکها ارسال بشه
+        bool running = true;
+        while(running){
+            
+            for(int i =0 ;i< 8; i++){
+                if(sendingChunks[i] != -1 )
+                {
+                    if(data->acknowledged_chunks[sendingChunks[i]] == 1)
+                    {
+                        // یعنی این چانک ارسال شده و اک شده
+                        // دو تا درایه از دو تا آرایه که مربوط به این چانک هست رو منفی یک میذاریم
+                        // باید سنت آنتین رو هم تغییر بدیم اگر نیاز باشه
+                        running = false;
+                        for(int j = 0; j< 8; j++){
+                            if(mustSentChunks[j] == sendingChunks[i])
+                            {
+                                if(sendingChunks[i] < sentUntil)
+                                {
+                                    sentUntil = sendingChunks[i];
+                                }
+                                mustSentChunks[j] = -1;
+                                sendingChunks[i] = -1;
+                                times[i] = 0;
+                            }
+                        }
+
+                    }
+                }
+            }
+
+
+            // باید تایم ارسال رو داشته باشیم و اگر از یه حدی بیشتر بشه و این هنوز حذف نشده باشه جذف کنیم تا دوباره ارسال بشه
+            // باید بررسی کنیم که سنت آنتیل کوچیکتر از اینی باشه که حذف کردیم
+            // اگر بزرگتر بود مقدارش رو تغییر میدیم که اول تابع بیاد دوباره ارسالش کنه
+            for(int i = 0 ; i< 8 ; i++){
+                if(sendingChunks[i] != -1){
+                    if(compare_time_in_ms(times[i])){
+                        for(int j =0 ; j< 8; j++){
+                            if(mustSentChunks[j] == sendingChunks[i])
+                            {
+                                if(mustSentChunks[j] != -1){
+                                    if(mustSentChunks[j] < sentUntil)
+                                        sentUntil = mustSentChunks[j];
+                                }
+                                mustSentChunks[j] = -1;
+                            }
+                        }
+                        sendingChunks[i] = -1;
+                        times[i] = 0;
+                        running = false;
+                    }
+
+                }
+            }
+
+
         }
-        
+
+
     }
+
+    usleep(500 * 1000);
 
     pthread_exit(NULL);
 }
