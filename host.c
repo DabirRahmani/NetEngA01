@@ -12,6 +12,10 @@
 #define PORT 12345            // Port number to be used by the server
 #define CHUNK_SIZE 10000      // Size of each file chunk to be sent
 
+int lock = 0; // 0 for opening main // 1 for opening handleClient
+char pub_ip_str[INET_ADDRSTRLEN];
+int pub_port;
+
 typedef struct {
     int sockfd;
     struct sockaddr_in client_addr;
@@ -31,6 +35,7 @@ typedef struct {
     struct sockaddr_in client_addr;
     int *acknowledged_chunks;
     int total_chunks;
+    pthread_t *ack_tid;
 } ack_thread_data_t;
 
 bool client_exists(client_info_t clients[], struct sockaddr_in *client_addr, int max_clients) {
@@ -45,14 +50,35 @@ bool client_exists(client_info_t clients[], struct sockaddr_in *client_addr, int
 void *listen_for_acks(void *arg) {
     ack_thread_data_t *data = (ack_thread_data_t *)arg;
     char buffer[CHUNK_SIZE];
-    socklen_t addr_len = sizeof(data->client_addr);
+    struct sockaddr_in recv_addr;
+    socklen_t recv_len = sizeof(recv_addr);
 
+    int wrongThreadForNTime = 0;
     while (1) {
-        int n = recvfrom(data->sockfd, buffer, sizeof(int), 0, (struct sockaddr *)&data->client_addr, &addr_len);
-        int seq_num_recvd = *(int *)buffer;
-        printf("Received seq ack: %d\n", seq_num_recvd);
-        if (seq_num_recvd < data->total_chunks) {
-            data->acknowledged_chunks[seq_num_recvd] = 1;
+        while(lock == 0) {}
+        int n = recvfrom(data->sockfd, buffer, sizeof(int) , 0, (struct sockaddr *)&recv_addr, &recv_len);
+        if(n <= 0 || wrongThreadForNTime > 100) {
+            printf("no ack receivec after 10 sec. deleting thread\n");
+            pthread_exit(NULL);
+            return 0; ///
+        }
+        int newRequest = *(int *)buffer;
+        if (newRequest == -1){
+            // یعنی درخواست ارسال فایل داریم
+            // یه لاک میذاریم و میریم تو خواب
+            // اونور که کارش تموم بشه لاک رو بر میداره
+            printf(" ************** send file request, changing lock *****************\n");
+            lock = 0;
+        } 
+        else if (recv_addr.sin_addr.s_addr == data->client_addr.sin_addr.s_addr && recv_addr.sin_port == data->client_addr.sin_port) {
+            int seq_num_recvd = *(int *)buffer;
+            //printf("Received seq ack: %d\n", seq_num_recvd);
+            if (seq_num_recvd < data->total_chunks) {
+                data->acknowledged_chunks[seq_num_recvd] = 1;
+            }
+            wrongThreadForNTime = 0;
+        } else{
+            wrongThreadForNTime++;
         }
     }
 
@@ -114,10 +140,9 @@ void *handle_client(void *arg) {
 
     long long times[8] = { 0,0,0,0,0,0,0,0};
 
-
+    int iiii= 0;
     while(true)
     {
-
         // بررسی شود که چه چانک هایی برای ارسال داریم
         // آرایه اول رو پر میکنیم تا اگر جا باشه ارسال کنیم
         for(int i = sentUntil; i<data->total_chunks ; i++){
@@ -162,7 +187,7 @@ void *handle_client(void *arg) {
                     {
                         if(mustSentChunks[i] != -1)
                         {
-                        printf("sending %d\n", mustSentChunks[i]);
+                        //printf("sending %d\n", mustSentChunks[i]);
                         send_file_chunk_with_seq(data->file, &data->client_addr, data->sockfd, mustSentChunks[i]);
                         times[j] = current_time_in_ms();
                         sendingChunks[j] = mustSentChunks[i]; 
@@ -288,23 +313,17 @@ int main() {
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
     int total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    int *acknowledged_chunks = (int *)calloc(total_chunks, sizeof(int));
-    if (!acknowledged_chunks) {
-        perror("Memory allocation failed");
-        fclose(file);
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    }
-    for (int i = 0; i < total_chunks; i++) {
-        acknowledged_chunks[i] = 0;
-    }
-
     printf("Must send %d chunks: \n", total_chunks);
 
 
     while (1) {
-        int n = recvfrom(sockfd, buffer, CHUNK_SIZE, 0, (struct sockaddr *)&client_addr, &addr_len);
-        if (n > 0) {
+        while(lock == 1) {}
+        int n = recvfrom(sockfd, buffer, sizeof(int), 0, (struct sockaddr *)&client_addr, &addr_len);
+        int doIStart = *(int *)buffer;
+        if (doIStart == -1){ 
+            // اینجا منتظر میمونیم که درخواست ارسال فایل بیاد. ممکنه این درخواست چند تا بیاد
+            // ما اینجا میسازیم. بعدش یه پیام باید ارسال کنیم که برات ساختیم دیگه درخواست نده
+            // حالا اونور که پیام رو بگیره. میره رو حالتی که فقط منتظر فایل باشه
             if (!client_exists(clients, &client_addr, MAX_CLIENTS)) {
                 for (int i = 0; i < MAX_CLIENTS; i++) {
                     if (!clients[i].active) {
@@ -312,15 +331,40 @@ int main() {
                         clients[i].active = true;
 
                         thread_data_t *data = (thread_data_t *)malloc(sizeof(thread_data_t));
+
+                        // Create separate file descriptor for each client
+                        FILE *file_copy = fopen("largefile.mkv", "rb");
+                        if (!file_copy) {
+                            perror("File open failed");
+                            continue;
+                        }
+
+                        // Allocate separate arrays for each client
+                        int *acknowledged_chunks = (int *)calloc(total_chunks, sizeof(int));
+                        if (!acknowledged_chunks) {
+                            perror("Memory allocation failed");
+                            fclose(file_copy);
+                            continue;
+                        }
+
+                        struct timeval timeout;
+                        timeout.tv_sec = 0;  // Zero seconds
+                        timeout.tv_usec = 10 * 1000 * 1000; // هر سوکت ۱۰ ثانیه صبر کنه و بعدش اگر چیزی دریافت نکرد حذفش کنیم
+                        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
                         data->sockfd = sockfd;
                         data->client_addr = client_addr;
-                        data->file = file;
-                        data->file_size = file_size;
+                        data->file = file_copy; // Use the separate file descriptor
                         data->total_chunks = total_chunks;
                         data->acknowledged_chunks = acknowledged_chunks;
 
                         printf("Creating a thread for:\n");
                         print_sockaddr_in(&data->client_addr);
+
+                        // اینجا پیام ساخته شدن سوکت رو ارسال میکنیم
+                        // تا کلاینت دیگه درخواست ساخت نده
+                        int created = -2;
+                        sendto(sockfd, &created, sizeof(int), 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
 
                         pthread_t tid;
                         pthread_create(&tid, NULL, handle_client, (void *)data);
@@ -329,8 +373,10 @@ int main() {
                     }
                 }
             }
+            lock = 1; // تابع مین رو قفل میکنیم تا از این به بعد فقط منتظر اک باشیم و دیگه درخواست ها اینجا نیاد
         }
     }
+
 
     fclose(file);
     close(sockfd);

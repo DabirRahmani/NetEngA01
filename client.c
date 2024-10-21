@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #define SERVER_PORT 12345      // Port number the server is using
 #define SERVER_IP "127.0.0.1"  // IP address of the server
@@ -46,6 +47,11 @@ void *receive_file_chunk(void *arg) {
             int position = seq_num * CHUNK_SIZE;
             printf("Chunk Length: %d, Seq: %d, Position: %d, TID: %d\n", chunk_length, seq_num, position, data->thread_id);
 
+            if(chunk_length == 0){
+                printf("terminating TID: %d \n", data->thread_id);
+                pthread_exit(NULL);
+                return 0;
+            }
             // Send ACK for the received chunk
             sendto(data->sockfd, &seq_num, sizeof(int), 0, (struct sockaddr *)&data->server_addr, sizeof(data->server_addr));
         }
@@ -79,9 +85,42 @@ int main() {
     server_addr.sin_port = htons(SERVER_PORT);   // Server port
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);  // Server IP address
 
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;  // Zero seconds
+    timeout.tv_usec = 50 * 1000; // تبدیل به نان بلاکینگ برای این که هر درخواست ۵۰ میلی ثانیه صبر کنه
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    // اینجا یه لوپ میسازیم تا درخواست بفرستیم
+    // بعد یک کم منتظر بمونیم اگر تایید نشد  دوباره 
     // Send a request to the server to start the file transfer
-    const char *request = "REQUEST_FILE";
-    sendto(sockfd, request, strlen(request), 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    int start = -1;
+    while(true){
+        printf("sending req to server\n");
+        sendto(sockfd, &start , sizeof(int), 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+        char buffer[sizeof(int)];
+        int n = recvfrom(sockfd, buffer, sizeof(int), 0, NULL, NULL);
+        if(n > 0){
+            int response = *(int *)buffer;
+            if(response != -2) {
+                printf("server didnt response -2 to start\n");
+                return 0; // سرور ارتباط نگرفته و دوباره درخواست میدیم
+            } else{
+                printf("connection establishment was successful\n");
+                break;
+            }
+        } else {
+            printf("nothing received\n");
+        }
+    }///
+
+    timeout.tv_sec = 0;  // Zero seconds
+    timeout.tv_usec = 0; // Zero microseconds اینجا دوباره سوکت رو تبدیل به بلاکینگ میکنیم
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)); 
+
+
+            
 
     // Create threads to receive file chunks
     for (int i = 0; i < NUM_THREADS; i++) {
